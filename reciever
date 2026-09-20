@@ -1,0 +1,764 @@
+/*
+ * ============================================================================
+ *  ESP32 + SX1276  ->  wM-Bus T1  ->  wodomierz Sensus iPERL  ->  MQTT (HA)
+ * ============================================================================
+ *  Wymagane biblioteki:
+ *    - PubSubClient  (Nick O'Leary)   -> MQTT
+ * ============================================================================
+ */
+
+#include <SPI.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <time.h>
+#include "mbedtls/aes.h"
+
+// ============================ KONFIGURACJA ==================================
+
+// --- WiFi -------------------------------------------------------------------
+static const char *WIFI_SSID = "TwojeSSID";
+static const char *WIFI_PASS = "TwojeHaslo";
+
+// --- MQTT -------------------------------------------------------------------
+static const char *MQTT_HOST = "192.168.1.10";
+static const uint16_t MQTT_PORT = 1883;
+static const char *MQTT_USER = "mqtt_user";
+static const char *MQTT_PASS = "mqtt_pass";
+
+static const char *NODE_ID   = "wmbus_water";       // unikalny id urzadzenia
+static const char *NODE_NAME = "Wodomierz wM-Bus";  // nazwa w Home Assistant
+
+// --- Licznik ----------------------------------------------------------------
+// ID licznika: 8 cyfr tak jak na obudowie / naklejce
+static const char *METER_ID = "12345678";
+
+// Klucz AES-128: 32 znaki HEX
+static const char *METER_KEY_HEX = "00112233445566778899AABBCCDDEEFF";
+
+// --- Piny -------------------------------------------------------------------
+#define PIN_SCK    5
+#define PIN_MISO   19
+#define PIN_MOSI   27
+#define PIN_CS     18
+#define PIN_RST    14
+#define PIN_IRQ    33
+
+// --- Radio ------------------------------------------------------------------
+static const uint32_t RF_FREQ_HZ = 868950000UL;   // 868.95 MHz (T1)
+
+// --- Rozne ------------------------------------------------------------------
+static const uint32_t WIFI_PUBLISH_MS = 30000;    // odswiezanie encji diagnostycznych
+static const char *NTP_SERVER = "pl.pool.ntp.org";
+
+// ======================== REJESTRY SX1276 (FSK) =============================
+
+#define REG_FIFO              0x00
+#define REG_OP_MODE           0x01
+#define REG_BITRATE_MSB       0x02
+#define REG_BITRATE_LSB       0x03
+#define REG_FDEV_MSB          0x04
+#define REG_FDEV_LSB          0x05
+#define REG_FRF_MSB           0x06
+#define REG_FRF_MID           0x07
+#define REG_FRF_LSB           0x08
+#define REG_PA_CONFIG         0x09
+#define REG_LNA               0x0C
+#define REG_RX_CONFIG         0x0D
+#define REG_RSSI_CONFIG       0x0E
+#define REG_RSSI_VALUE        0x11
+#define REG_RX_BW             0x12
+#define REG_AFC_BW            0x13
+#define REG_AFC_FEI           0x1A
+#define REG_PREAMBLE_DETECT   0x1F
+#define REG_SYNC_CONFIG       0x27
+#define REG_SYNC_VALUE1       0x28
+#define REG_SYNC_VALUE2       0x29
+#define REG_PACKET_CONFIG1    0x30
+#define REG_PACKET_CONFIG2    0x31
+#define REG_PAYLOAD_LENGTH    0x32
+#define REG_FIFO_THRESH       0x35
+#define REG_IRQ_FLAGS1        0x3E
+#define REG_IRQ_FLAGS2        0x3F
+#define REG_DIO_MAPPING1      0x40
+#define REG_DIO_MAPPING2      0x41
+#define REG_VERSION           0x42
+
+#define MODE_SLEEP            0x00
+#define MODE_STDBY            0x01
+#define MODE_RX               0x05
+#define MODE_FSK              0x00   // LongRangeMode = 0
+
+#define IRQ2_FIFO_EMPTY       0x40
+#define IRQ2_FIFO_OVERRUN     0x10
+#define IRQ1_SYNC_MATCH       0x01
+
+// ============================ STAN GLOBALNY =================================
+
+static SPIClass spiRadio(VSPI);
+static WiFiClient net;
+static PubSubClient mqtt(net);
+
+static uint8_t meterKey[16];
+static uint32_t meterIdBin = 0;    // ID licznika jako liczba (z BCD)
+
+struct MeterData {
+  bool     valid = false;
+  double   total_m3 = 0;
+  bool     has_flow = false;
+  double   flow_m3h = 0;
+  uint8_t  status = 0;
+  int16_t  rssi = 0;
+  time_t   last_seen = 0;
+};
+
+static MeterData g_data;
+static portMUX_TYPE g_mux = portMUX_INITIALIZER_UNLOCKED;
+static volatile bool g_newTelegram = false;
+
+static char g_stateTopic[96];
+static char g_availTopic[96];
+
+// ========================== NISKI POZIOM SPI ================================
+
+static inline void radioSelect(bool on) { digitalWrite(PIN_CS, on ? LOW : HIGH); }
+
+static uint8_t regRead(uint8_t addr) {
+  spiRadio.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
+  radioSelect(true);
+  spiRadio.transfer(addr & 0x7F);
+  uint8_t v = spiRadio.transfer(0x00);
+  radioSelect(false);
+  spiRadio.endTransaction();
+  return v;
+}
+
+static void regWrite(uint8_t addr, uint8_t val) {
+  spiRadio.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
+  radioSelect(true);
+  spiRadio.transfer(addr | 0x80);
+  spiRadio.transfer(val);
+  radioSelect(false);
+  spiRadio.endTransaction();
+}
+
+static void regBurstRead(uint8_t addr, uint8_t *buf, size_t len) {
+  spiRadio.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
+  radioSelect(true);
+  spiRadio.transfer(addr & 0x7F);
+  for (size_t i = 0; i < len; i++) buf[i] = spiRadio.transfer(0x00);
+  radioSelect(false);
+  spiRadio.endTransaction();
+}
+
+static void setOpMode(uint8_t mode) {
+  regWrite(REG_OP_MODE, MODE_FSK | (mode & 0x07));
+}
+
+// ========================== KONFIGURACJA RADIA ==============================
+
+static bool radioInit() {
+  pinMode(PIN_CS, OUTPUT);
+  digitalWrite(PIN_CS, HIGH);
+  pinMode(PIN_RST, OUTPUT);
+  pinMode(PIN_IRQ, INPUT);
+
+  spiRadio.begin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CS);
+
+  // twardy reset
+  digitalWrite(PIN_RST, LOW);
+  delay(10);
+  digitalWrite(PIN_RST, HIGH);
+  delay(50);
+
+  uint8_t ver = regRead(REG_VERSION);
+  Serial.printf("SX1276 RegVersion = 0x%02X (oczekiwane 0x12)\n", ver);
+  if (ver != 0x12) return false;
+
+  setOpMode(MODE_SLEEP);
+  delay(5);
+  setOpMode(MODE_STDBY);
+
+  // Czestotliwosc: Frf = f / Fstep, Fstep = 32e6 / 2^19 = 61.03515625 Hz
+  uint32_t frf = (uint32_t)(((uint64_t)RF_FREQ_HZ << 19) / 32000000ULL);
+  regWrite(REG_FRF_MSB, (frf >> 16) & 0xFF);
+  regWrite(REG_FRF_MID, (frf >> 8) & 0xFF);
+  regWrite(REG_FRF_LSB, frf & 0xFF);
+
+  // Bitrate 100 kbps: 32e6 / 100000 = 320 = 0x0140
+  regWrite(REG_BITRATE_MSB, 0x01);
+  regWrite(REG_BITRATE_LSB, 0x40);
+
+  // Dewiacja 50 kHz: 50000 / 61.035 = 819 = 0x0333
+  regWrite(REG_FDEV_MSB, 0x03);
+  regWrite(REG_FDEV_LSB, 0x33);
+
+  // RxBw = 250 kHz (mant=16, exp=1)
+  regWrite(REG_RX_BW, 0x01);
+  regWrite(REG_AFC_BW, 0x01);
+
+  // LNA: max wzmocnienie + boost
+  regWrite(REG_LNA, 0x23);
+
+  // AGC on, AFC off, restart RX on preamble
+  regWrite(REG_RX_CONFIG, 0x0E);
+
+  // Detektor preambuly: on, 2 bajty, tolerancja 10
+  regWrite(REG_PREAMBLE_DETECT, 0xAA);
+
+  // Sync: AutoRestartRx z PLL lock, polaryzacja 0xAA, 2 bajty sync
+  regWrite(REG_SYNC_CONFIG, 0x51);
+  regWrite(REG_SYNC_VALUE1, 0x54);   // slowo synchronizacji trybu T
+  regWrite(REG_SYNC_VALUE2, 0x3D);
+
+  // Pakiet: zmienna dlugosc wylaczona, brak DC-free, brak CRC, brak adresu
+  regWrite(REG_PACKET_CONFIG1, 0x00);
+  regWrite(REG_PACKET_CONFIG2, 0x40);   // tryb pakietowy
+  regWrite(REG_PAYLOAD_LENGTH, 0x00);   // 0 = nieograniczona dlugosc
+
+  // Prog FIFO = 16 bajtow -> DIO1 (FifoLevel) w gore gdy jest co czytac
+  regWrite(REG_FIFO_THRESH, 0x10);
+
+  // DIO1 = FifoLevel w trybie RX (bity 5:4 = 00)
+  regWrite(REG_DIO_MAPPING1, 0x00);
+  regWrite(REG_DIO_MAPPING2, 0x00);
+
+  setOpMode(MODE_RX);
+  return true;
+}
+
+static void radioRestartRx() {
+  setOpMode(MODE_STDBY);
+  delayMicroseconds(200);
+  setOpMode(MODE_RX);
+}
+
+static inline bool fifoHasData() {
+  return (regRead(REG_IRQ_FLAGS2) & IRQ2_FIFO_EMPTY) == 0;
+}
+
+// ============================ DEKODER 3-of-6 ================================
+
+static int8_t decode3of6(uint8_t chip) {
+  switch (chip & 0x3F) {
+    case 0x16: return 0x0; case 0x0D: return 0x1;
+    case 0x0E: return 0x2; case 0x0B: return 0x3;
+    case 0x1C: return 0x4; case 0x19: return 0x5;
+    case 0x1A: return 0x6; case 0x13: return 0x7;
+    case 0x2C: return 0x8; case 0x25: return 0x9;
+    case 0x26: return 0xA; case 0x23: return 0xB;
+    case 0x34: return 0xC; case 0x31: return 0xD;
+    case 0x32: return 0xE; case 0x29: return 0xF;
+    default:   return -1;
+  }
+}
+
+// Zamienia strumien chipow (3-of-6) na bajty danych.
+// nChipBytes * 8 bitow -> co 12 bitow powstaje 1 bajt.
+static int decodeChips(const uint8_t *chips, size_t nChipBytes,
+                       uint8_t *out, size_t outMax) {
+  size_t bitPos = 0;
+  size_t totalBits = nChipBytes * 8;
+  size_t nOut = 0;
+
+  auto take6 = [&](uint8_t &v) -> bool {
+    if (bitPos + 6 > totalBits) return false;
+    v = 0;
+    for (int i = 0; i < 6; i++) {
+      size_t b = bitPos + i;
+      uint8_t bit = (chips[b >> 3] >> (7 - (b & 7))) & 1;
+      v = (v << 1) | bit;
+    }
+    bitPos += 6;
+    return true;
+  };
+
+  while (nOut < outMax) {
+    uint8_t c1, c2;
+    if (!take6(c1)) break;
+    if (!take6(c2)) break;
+    int8_t hi = decode3of6(c1);
+    int8_t lo = decode3of6(c2);
+    if (hi < 0 || lo < 0) return -1;            // blad 3-of-6
+    out[nOut++] = (uint8_t)((hi << 4) | lo);
+  }
+  return (int)nOut;
+}
+
+// ============================== CRC EN 13757 ================================
+
+static uint16_t crc13757(const uint8_t *data, size_t len) {
+  uint16_t crc = 0x0000;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= (uint16_t)data[i] << 8;
+    for (int b = 0; b < 8; b++) {
+      if (crc & 0x8000) crc = (uint16_t)((crc << 1) ^ 0x3D65);
+      else              crc = (uint16_t)(crc << 1);
+    }
+  }
+  return (uint16_t)~crc;
+}
+
+// Ramka formatu A: blok1 = 10B + CRC, kolejne bloki = 16B + CRC.
+// Zwraca dlugosc telegramu bez CRC albo -1.
+static int stripFormatA(const uint8_t *raw, size_t rawLen, uint8_t *out, size_t outMax) {
+  if (rawLen < 12) return -1;
+  uint16_t crc = crc13757(raw, 10);
+  if (((raw[10] << 8) | raw[11]) != crc) return -1;
+
+  size_t nOut = 0;
+  if (10 > outMax) return -1;
+  memcpy(out, raw, 10);
+  nOut = 10;
+
+  size_t pos = 12;
+  size_t remaining = (size_t)raw[0] + 1 - 10;   // L+1 = calkowita liczba bajtow danych
+  while (remaining > 0) {
+    size_t blk = remaining > 16 ? 16 : remaining;
+    if (pos + blk + 2 > rawLen) return -1;
+    uint16_t c = crc13757(raw + pos, blk);
+    if (((raw[pos + blk] << 8) | raw[pos + blk + 1]) != c) return -1;
+    if (nOut + blk > outMax) return -1;
+    memcpy(out + nOut, raw + pos, blk);
+    nOut += blk;
+    pos += blk + 2;
+    remaining -= blk;
+  }
+  return (int)nOut;
+}
+
+// Liczba bajtow surowych (z CRC) dla danego L, format A
+static size_t rawLenForL(uint8_t L) {
+  size_t data = (size_t)L + 1;
+  if (data < 10) return 0;
+  size_t rest = data - 10;
+  size_t blocks = (rest + 15) / 16;
+  return 12 + rest + blocks * 2;
+}
+
+// ============================== DESZYFROWANIE ===============================
+
+static bool aesCbcDecrypt(const uint8_t *in, size_t len, const uint8_t *iv, uint8_t *out) {
+  if (len == 0 || (len % 16) != 0) return false;
+  uint8_t ivCopy[16];
+  memcpy(ivCopy, iv, 16);
+  mbedtls_aes_context aes;
+  mbedtls_aes_init(&aes);
+  if (mbedtls_aes_setkey_dec(&aes, meterKey, 128) != 0) { mbedtls_aes_free(&aes); return false; }
+  int rc = mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_DECRYPT, len, ivCopy, in, out);
+  mbedtls_aes_free(&aes);
+  return rc == 0;
+}
+
+// ============================ PARSER DIF/VIF ================================
+
+static int difDataLen(uint8_t dif) {
+  switch (dif & 0x0F) {
+    case 0x0: return 0;
+    case 0x1: return 1;
+    case 0x2: return 2;
+    case 0x3: return 3;
+    case 0x4: return 4;
+    case 0x5: return 4;   // float32
+    case 0x6: return 6;
+    case 0x7: return 8;
+    case 0x8: return 0;   // selection for readout
+    case 0x9: return 1;   // BCD2
+    case 0xA: return 2;   // BCD4
+    case 0xB: return 3;   // BCD6
+    case 0xC: return 4;   // BCD8
+    case 0xD: return -1;  // LVAR
+    case 0xE: return 6;   // BCD12
+    case 0xF: return -2;  // special
+  }
+  return -1;
+}
+
+static int64_t readIntLE(const uint8_t *p, int n) {
+  int64_t v = 0;
+  for (int i = n - 1; i >= 0; i--) v = (v << 8) | p[i];
+  // rozszerzenie znaku
+  if (n > 0 && (p[n - 1] & 0x80)) {
+    int64_t mask = ~((int64_t)0);
+    v |= (mask << (n * 8));
+  }
+  return v;
+}
+
+static int64_t readBcdLE(const uint8_t *p, int n) {
+  int64_t v = 0;
+  for (int i = n - 1; i >= 0; i--) {
+    v = v * 100 + ((p[i] >> 4) & 0x0F) * 10 + (p[i] & 0x0F);
+  }
+  return v;
+}
+
+// Parsuje rekordy APL i wypelnia MeterData
+static void parseRecords(const uint8_t *p, size_t len, MeterData &d) {
+  size_t i = 0;
+  while (i < len) {
+    uint8_t dif = p[i];
+    if (dif == 0x2F) { i++; continue; }          // wypelniacz
+    if (dif == 0x0F || dif == 0x1F) break;       // dane producenta - konczymy
+    i++;
+
+    // DIFE
+    int dife = 0;
+    while ((i < len) && (dif & 0x80) && dife < 10) {
+      uint8_t e = p[i++];
+      dife++;
+      if (!(e & 0x80)) break;
+    }
+
+    if (i >= len) break;
+    uint8_t vif = p[i++];
+    uint8_t vifPrimary = vif & 0x7F;
+    // VIFE
+    int vife = 0;
+    uint8_t lastVif = vif;
+    while ((i < len) && (lastVif & 0x80) && vife < 10) {
+      lastVif = p[i++];
+      vife++;
+    }
+
+    int dl = difDataLen(dif);
+    if (dl == -1) {                               // LVAR
+      if (i >= len) break;
+      dl = p[i++];
+    } else if (dl == -2) {
+      break;                                      // special function
+    }
+    if (i + (size_t)dl > len) break;
+
+    const uint8_t *val = p + i;
+    bool isBcd = ((dif & 0x0F) >= 0x9 && (dif & 0x0F) <= 0xC) || ((dif & 0x0F) == 0xE);
+    int64_t raw = isBcd ? readBcdLE(val, dl) : readIntLE(val, dl);
+    i += dl;
+
+    // --- objetosc: VIF 0x10..0x17, mnoznik 10^(n-6) m3 ---
+    if (vifPrimary >= 0x10 && vifPrimary <= 0x17) {
+      double mult = pow(10.0, (double)((vifPrimary & 0x07) - 6));
+      d.total_m3 = (double)raw * mult;
+      d.valid = true;
+    }
+    // --- przeplyw objetosciowy: VIF 0x38..0x3F, mnoznik 10^(n-6) m3/h ---
+    else if (vifPrimary >= 0x38 && vifPrimary <= 0x3F) {
+      double mult = pow(10.0, (double)((vifPrimary & 0x07) - 6));
+      d.flow_m3h = (double)raw * mult;
+      d.has_flow = true;
+    }
+  }
+}
+
+// ========================== OBSLUGA TELEGRAMU ===============================
+
+static void handleTelegram(const uint8_t *t, size_t len, int16_t rssi) {
+  if (len < 11) return;
+
+  // L C M1 M2 ID1 ID2 ID3 ID4 VER TYPE CI ...
+  uint32_t id = (uint32_t)readBcdLE(t + 4, 4);
+  if (id != meterIdBin) {
+    Serial.printf("Telegram od innego licznika: %08u\n", id);
+    return;
+  }
+
+  uint8_t ci = t[10];
+  if (ci != 0x7A) {   // krotki naglowek TPL - iPERL uzywa 0x7A
+    Serial.printf("Nieobslugiwany CI = 0x%02X\n", ci);
+    return;
+  }
+  if (len < 15) return;
+
+  uint8_t  acc = t[11];
+  uint8_t  sts = t[12];
+  uint16_t cw  = (uint16_t)t[13] | ((uint16_t)t[14] << 8);
+  uint8_t  mode   = (cw >> 8) & 0x1F;
+  uint8_t  blocks = (cw >> 4) & 0x0F;
+
+  const uint8_t *apl = t + 15;
+  size_t aplLen = len - 15;
+
+  static uint8_t plain[256];
+
+  if (mode == 0) {
+    if (aplLen > sizeof(plain)) return;
+    memcpy(plain, apl, aplLen);
+  } else if (mode == 5) {
+    size_t encLen = (size_t)blocks * 16;
+    if (encLen == 0 || encLen > aplLen || encLen > sizeof(plain)) return;
+
+    // IV = M(2) + A(6) + ACC x8
+    uint8_t iv[16];
+    iv[0] = t[2]; iv[1] = t[3];
+    memcpy(iv + 2, t + 4, 6);           // ID(4) + VER + TYPE
+    for (int i = 8; i < 16; i++) iv[i] = acc;
+
+    if (!aesCbcDecrypt(apl, encLen, iv, plain)) return;
+    if (plain[0] != 0x2F || plain[1] != 0x2F) {
+      Serial.println("Deszyfrowanie nieudane - sprawdz klucz AES");
+      return;
+    }
+    // doklej nieszyfrowana reszte
+    size_t restLen = aplLen - encLen;
+    if (encLen + restLen <= sizeof(plain)) {
+      memcpy(plain + encLen, apl + encLen, restLen);
+      aplLen = encLen + restLen;
+    } else {
+      aplLen = encLen;
+    }
+  } else {
+    Serial.printf("Nieobslugiwany tryb szyfrowania: %u\n", mode);
+    return;
+  }
+
+  MeterData d;
+  parseRecords(plain, aplLen, d);
+  if (!d.valid) return;
+
+  d.status = sts;
+  d.rssi = rssi;
+  d.last_seen = time(nullptr);
+
+  portENTER_CRITICAL(&g_mux);
+  double prevFlow = g_data.flow_m3h;
+  bool prevHasFlow = g_data.has_flow;
+  g_data = d;
+  if (!d.has_flow && prevHasFlow) { g_data.flow_m3h = prevFlow; g_data.has_flow = true; }
+  g_newTelegram = true;
+  portEXIT_CRITICAL(&g_mux);
+
+  Serial.printf("OK: %.3f m3, przeplyw %.3f m3/h, status 0x%02X, RSSI %d dBm\n",
+                d.total_m3, d.flow_m3h, d.status, rssi);
+}
+
+// ============================ ZADANIE ODBIORU ===============================
+
+static void radioTask(void *arg) {
+  static uint8_t chips[512];
+  static uint8_t raw[300];
+  static uint8_t tel[256];
+
+  for (;;) {
+    // czekaj na dane w FIFO
+    if (!fifoHasData()) { vTaskDelay(1); continue; }
+
+    int16_t rssi = -(int16_t)(regRead(REG_RSSI_VALUE) / 2);
+
+    size_t nChips = 0;
+    uint32_t lastByte = millis();
+    size_t needChips = 0;       // 0 = jeszcze nie znamy dlugosci
+    bool overrun = false;
+
+    while (true) {
+      uint8_t f2 = regRead(REG_IRQ_FLAGS2);
+      if (f2 & IRQ2_FIFO_OVERRUN) { overrun = true; break; }
+
+      if (!(f2 & IRQ2_FIFO_EMPTY)) {
+        if (nChips >= sizeof(chips)) break;
+        chips[nChips++] = regRead(REG_FIFO);
+        lastByte = millis();
+
+        // po 3 bajtach chipow znamy L (pierwszy zdekodowany bajt)
+        if (needChips == 0 && nChips >= 3) {
+          uint8_t hdr[2];
+          if (decodeChips(chips, 3, hdr, 2) == 2) {
+            size_t rl = rawLenForL(hdr[0]);
+            if (rl == 0 || rl > sizeof(raw)) break;
+            needChips = (rl * 3 + 1) / 2;         // 1 bajt danych = 1.5 bajta chipow
+            if (needChips > sizeof(chips)) break;
+          } else {
+            break;                                 // niepoprawny 3-of-6
+          }
+        }
+        if (needChips && nChips >= needChips) break;
+      } else {
+        if (millis() - lastByte > 30) break;        // koniec transmisji / timeout
+        vTaskDelay(1);
+      }
+    }
+
+    if (!overrun && needChips && nChips >= needChips) {
+      int rawLen = decodeChips(chips, nChips, raw, sizeof(raw));
+      if (rawLen > 12) {
+        int telLen = stripFormatA(raw, (size_t)rawLen, tel, sizeof(tel));
+        if (telLen > 0) handleTelegram(tel, (size_t)telLen, rssi);
+      }
+    }
+
+    radioRestartRx();
+  }
+}
+
+// ================================ MQTT ======================================
+
+static void mqttPublishDiscovery() {
+  char topic[160];
+  char payload[700];
+  char uid[64];
+
+  auto dev = [&](char *buf, size_t n) {
+    snprintf(buf, n,
+      "\"dev\":{\"ids\":[\"%s\"],\"name\":\"%s\",\"mf\":\"DIY\",\"mdl\":\"ESP32 + SX1276\"}",
+      NODE_ID, NODE_NAME);
+  };
+  char devStr[200];
+  dev(devStr, sizeof(devStr));
+
+  struct Ent {
+    const char *key;      // klucz w JSON stanu
+    const char *name;
+    const char *unit;
+    const char *devClass;
+    const char *stateClass;
+    const char *category;  // nullptr lub "diagnostic"
+    bool isText;
+  };
+
+  static const Ent ents[] = {
+    {"total_m3",     "Stan licznika",        "m³",   "water",           "total_increasing", nullptr,      false},
+    {"max_flow",     "Maksymalny przeplyw",  "m³/h", "volume_flow_rate","measurement",      nullptr,      false},
+    {"last_seen",    "Ostatnie polaczenie",  nullptr,"timestamp",       nullptr,            "diagnostic", true },
+    {"meter_rssi",   "RSSI licznika",        "dBm",  "signal_strength", "measurement",      "diagnostic", false},
+    {"wifi_rssi",    "WiFi moc sygnalu",     "dBm",  "signal_strength", "measurement",      "diagnostic", false},
+    {"wifi_quality", "WiFi jakosc sygnalu",  "%",    nullptr,           "measurement",      "diagnostic", false},
+    {"ip",           "Adres IP",             nullptr,nullptr,           nullptr,            "diagnostic", true },
+    {"ssid",         "Podlaczone SSID",      nullptr,nullptr,           nullptr,            "diagnostic", true },
+    {"status",       "Status licznika",      nullptr,nullptr,           nullptr,            "diagnostic", true },
+  };
+
+  for (const Ent &e : ents) {
+    snprintf(uid, sizeof(uid), "%s_%s", NODE_ID, e.key);
+    snprintf(topic, sizeof(topic), "homeassistant/sensor/%s/%s/config", NODE_ID, e.key);
+
+    int n = snprintf(payload, sizeof(payload),
+      "{\"name\":\"%s\",\"uniq_id\":\"%s\",\"stat_t\":\"%s\","
+      "\"avty_t\":\"%s\",\"val_tpl\":\"{{ value_json.%s }}\",%s",
+      e.name, uid, g_stateTopic, g_availTopic, e.key, devStr);
+
+    if (e.unit)       n += snprintf(payload + n, sizeof(payload) - n, ",\"unit_of_meas\":\"%s\"", e.unit);
+    if (e.devClass)   n += snprintf(payload + n, sizeof(payload) - n, ",\"dev_cla\":\"%s\"", e.devClass);
+    if (e.stateClass) n += snprintf(payload + n, sizeof(payload) - n, ",\"stat_cla\":\"%s\"", e.stateClass);
+    if (e.category)   n += snprintf(payload + n, sizeof(payload) - n, ",\"ent_cat\":\"%s\"", e.category);
+    snprintf(payload + n, sizeof(payload) - n, "}");
+
+    mqtt.publish(topic, payload, true);
+    delay(20);
+  }
+  Serial.println("MQTT discovery opublikowane");
+}
+
+static void mqttPublishState() {
+  MeterData d;
+  portENTER_CRITICAL(&g_mux);
+  d = g_data;
+  portEXIT_CRITICAL(&g_mux);
+
+  int rssi = WiFi.RSSI();
+  int quality = rssi <= -100 ? 0 : (rssi >= -50 ? 100 : 2 * (rssi + 100));
+
+  char lastSeen[32] = "";
+  if (d.last_seen > 0) {
+    struct tm tmv;
+    gmtime_r(&d.last_seen, &tmv);
+    strftime(lastSeen, sizeof(lastSeen), "%Y-%m-%dT%H:%M:%SZ", &tmv);
+  }
+
+  char payload[512];
+  int n = snprintf(payload, sizeof(payload), "{");
+  if (d.valid) {
+    n += snprintf(payload + n, sizeof(payload) - n,
+      "\"total_m3\":%.3f,\"max_flow\":%.3f,\"meter_rssi\":%d,"
+      "\"status\":\"%s\",\"last_seen\":\"%s\",",
+      d.total_m3, d.flow_m3h, d.rssi,
+      d.status == 0 ? "OK" : "ALARM", lastSeen);
+  }
+  n += snprintf(payload + n, sizeof(payload) - n,
+    "\"wifi_rssi\":%d,\"wifi_quality\":%d,\"ip\":\"%s\",\"ssid\":\"%s\"}",
+    rssi, quality, WiFi.localIP().toString().c_str(), WiFi.SSID().c_str());
+
+  mqtt.publish(g_stateTopic, payload, true);
+}
+
+static void mqttEnsureConnected() {
+  if (mqtt.connected()) return;
+  Serial.print("Laczenie z MQTT... ");
+  if (mqtt.connect(NODE_ID, MQTT_USER, MQTT_PASS, g_availTopic, 0, true, "offline")) {
+    Serial.println("OK");
+    mqtt.publish(g_availTopic, "online", true);
+    mqttPublishDiscovery();
+    mqttPublishState();
+  } else {
+    Serial.printf("blad rc=%d\n", mqtt.state());
+    delay(2000);
+  }
+}
+
+// ================================ SETUP =====================================
+
+static bool parseHexKey(const char *hex, uint8_t *out, size_t outLen) {
+  if (strlen(hex) != outLen * 2) return false;
+  for (size_t i = 0; i < outLen; i++) {
+    char b[3] = { hex[i * 2], hex[i * 2 + 1], 0 };
+    char *end;
+    long v = strtol(b, &end, 16);
+    if (*end) return false;
+    out[i] = (uint8_t)v;
+  }
+  return true;
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  Serial.println("\n=== wM-Bus T1 iPERL -> MQTT ===");
+
+  if (!parseHexKey(METER_KEY_HEX, meterKey, 16)) {
+    Serial.println("BLAD: klucz AES musi miec 32 znaki HEX");
+  }
+  meterIdBin = (uint32_t)strtoul(METER_ID, nullptr, 10);
+
+  snprintf(g_stateTopic, sizeof(g_stateTopic), "wmbus/%s/state", NODE_ID);
+  snprintf(g_availTopic, sizeof(g_availTopic), "wmbus/%s/availability", NODE_ID);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("WiFi");
+  while (WiFi.status() != WL_CONNECTED) { delay(400); Serial.print("."); }
+  Serial.printf(" OK, IP: %s\n", WiFi.localIP().toString().c_str());
+
+  configTime(0, 0, NTP_SERVER, "pool.ntp.org");
+
+  mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  mqtt.setBufferSize(1024);          // wazne: discovery nie zmiesci sie w 256 B
+
+  if (!radioInit()) {
+    Serial.println("BLAD: brak komunikacji z SX1276 - sprawdz piny SPI/CS/RESET");
+  } else {
+    xTaskCreatePinnedToCore(radioTask, "radio", 8192, nullptr, 5, nullptr, 0);
+    Serial.println("Odbiornik uruchomiony (T1, 868.95 MHz)");
+  }
+}
+
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) {
+    WiFi.reconnect();
+    delay(1000);
+    return;
+  }
+  mqttEnsureConnected();
+  mqtt.loop();
+
+  static uint32_t lastPub = 0;
+  bool fresh = false;
+
+  portENTER_CRITICAL(&g_mux);
+  if (g_newTelegram) { g_newTelegram = false; fresh = true; }
+  portEXIT_CRITICAL(&g_mux);
+
+  if (fresh || millis() - lastPub > WIFI_PUBLISH_MS) {
+    lastPub = millis();
+    if (mqtt.connected()) mqttPublishState();
+  }
+
+  delay(10);
+}
