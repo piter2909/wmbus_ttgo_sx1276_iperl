@@ -15,15 +15,20 @@ Board:
 
 
 
+
 Edit configuration values.
+
+External library required: PubSubClient (Nick O'Leary)
 
 
 Home Assistant entities:
 
 
+<img width="321" height="503" alt="wmbus" src="https://github.com/user-attachments/assets/a25a907f-a58b-4611-afab-1b3582522f6a" />
 
 
-<img width="321" height="503" alt="image" src="https://github.com/user-attachments/assets/ea647339-2de0-4ad9-ab3e-bf3d0b93bb76" />
+
+
 
 
 
